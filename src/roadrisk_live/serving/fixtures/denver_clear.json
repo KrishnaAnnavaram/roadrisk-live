@@ -1,0 +1,5 @@
+{"units": "imperial", "state": "CO", "note": "illustrative response in imperial units (Fahrenheit, mph)",
+ "response": {"coord": {"lon": -104.985, "lat": 39.739}, "weather": [{"id": 800, "main": "Clear", "description": "clear sky"}],
+  "main": {"temp": 71.3, "humidity": 24, "pressure": 1016}, "visibility": 10000, "wind": {"speed": 7.0},
+  "dt": 1716224400, "sys": {"country": "US", "sunrise": 1716204900, "sunset": 1716257400},
+  "timezone": -21600, "name": "Denver"}}

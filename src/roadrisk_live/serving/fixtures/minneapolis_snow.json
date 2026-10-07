@@ -1,0 +1,5 @@
+{"units": "standard", "state": "MN", "note": "illustrative response in standard units (Kelvin, m/s)",
+ "response": {"coord": {"lon": -93.265, "lat": 44.978}, "weather": [{"id": 601, "main": "Snow", "description": "snow"}],
+  "main": {"temp": 266.15, "humidity": 92, "pressure": 1009}, "visibility": 1200, "wind": {"speed": 6.2},
+  "snow": {"1h": 1.8}, "dt": 1705386600, "sys": {"country": "US", "sunrise": 1705412400, "sunset": 1705445400},
+  "timezone": -21600, "name": "Minneapolis"}}
