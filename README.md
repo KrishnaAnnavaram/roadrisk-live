@@ -448,7 +448,7 @@ Credentials are only in a local `.env` file. Git ignores this file. Do not print
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **35 passed** (also 35 passed in a clean environment with the dev extra only) | `pytest -q` |
+| Unit tests (CI installs only `.[dev]`) | **35 passed**, 0 skipped. No test needs an optional extra | `pytest -q` |
 | Offline demo, severity (synthetic data) | See the first table | `roadrisk demo` |
 | Offline demo, live scores (fixtures) | See the second table | `roadrisk demo` |
 | Offline demo, forecast backtest (synthetic counts) | See the third table | `roadrisk demo` |
