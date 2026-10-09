@@ -71,6 +71,7 @@ This README is the **one location that explains all of roadrisk-live**. It gives
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one live score](#42-the-life-cycle-of-one-live-score)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Data preparation and features](#5-data-preparation-and-features)
 6. 🟢 [The severity models](#6-the-severity-models)
 7. 🟣 [Live scoring and the count forecasts](#7-live-scoring-and-the-count-forecasts)
@@ -138,6 +139,52 @@ flowchart LR
 | Backtest | `src/roadrisk_live/forecast/backtest.py` | Rolling-origin evaluation and summary |
 | CLI | `src/roadrisk_live/cli.py` | The `roadrisk` command |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry points"]
+        CLI["cli.py<br/>roadrisk command"]
+        API["serving/api.py<br/>create_app, handle_score"]
+    end
+    subgraph DATA["Data"]
+        CFG["config.py<br/>load_settings"]
+        ACC["data/accidents.py<br/>load_accidents, time_split"]
+        SYN["data/synthetic.py<br/>make_accidents, make_daily_counts"]
+    end
+    subgraph FEATS["Features"]
+        WEA["features/weather.py<br/>VOCAB, unit conversions, RANGES"]
+        BLD["features/build.py<br/>time_features, geo_cell, make_preprocessor"]
+    end
+    subgraph MODELS["Models"]
+        SEV["severity.py<br/>train_and_select, save_bundle"]
+        FCM["forecast/models.py<br/>FORECASTERS"]
+        BT["forecast/backtest.py<br/>backtest, summarize"]
+    end
+    subgraph SERVE["Live scoring"]
+        PROV["serving/weather.py<br/>OpenWeatherClient, FixtureWeatherProvider"]
+        SCO["serving/scoring.py<br/>feature_row, score"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> ACC
+    CLI --> SEV
+    CLI --> BT
+    CLI --> API
+    API --> SEV
+    API --> PROV
+    API --> SCO
+    ACC --> BLD
+    ACC --> WEA
+    BLD --> WEA
+    SEV --> BLD
+    PROV --> WEA
+    SCO --> BLD
+    SCO --> WEA
+    BT --> FCM
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -184,6 +231,17 @@ Imputation, scaling and one-hot encoding are steps of the scikit-learn pipeline.
 ### 3.3 One weather vocabulary
 `from_text` maps the training conditions and `from_openweather_id` maps the live condition ids to the same eleven categories.
 
+```mermaid
+flowchart LR
+    TXT[/"Training text<br/>Weather_Condition, for example Light Rain"/] --> FT["from_text<br/>first matching rule"]
+    OWID[/"Live condition id<br/>weather[0].id, for example 500"/] --> FO["from_openweather_id<br/>id ranges"]
+    FT --> VOC[("VOCAB<br/>11 categories")]
+    FO --> VOC
+    VOC --> TF["Same feature functions<br/>time_features, geo_cell"]
+    TF --> PIPE["Same bundle pipeline<br/>one-hot weather_cat"]
+    PIPE --> OUT[/"Severity probabilities"/]
+```
+
 ### 3.4 Correct units and range checks
 `parse_current` reads the units of the request and converts each value to the training unit. `feature_row` refuses a value outside its physical range, so a unit error stops with an error and never reaches the model.
 
@@ -206,23 +264,62 @@ Each forecaster gets the history up to the origin. No forecaster trains on a for
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    RAW["US_Accidents_March23.csv"] --> LOAD["chunked loader: all rows"]
-    LOAD --> VAL["validate: time, severity 1-4, physical ranges"]
-    VAL --> FEAT["features: weather category, local time, geo cell, road flags"]
-    FEAT --> SPLIT["split by date: train / valid / test"]
-    SPLIT --> FIT["fit majority, logreg, hgb on train (class weights)"]
-    FIT --> SEL["select by valid macro-F1"]
-    SEL --> TEST["test report once + per source"]
-    SEL --> BUN["bundle"]
-    OW["OpenWeather response"] --> PARSE["parse: units, local time, category, state"]
-    PARSE --> ROW["feature row + range checks"]
-    ROW --> BUN
-    BUN --> SCORE["live score"]
-    FEAT --> CNT["daily counts"] --> BT["backtest: 4 forecasters"]
+flowchart TD
+    SRCQ{"Data source"} -- "roadrisk prepare" --> RAW[/"US_Accidents_March23.csv<br/>or parquet"/]
+    SRCQ -- "roadrisk demo" --> SYN["make_accidents<br/>synthetic rows"]
+    RAW --> LOAD["load_accidents<br/>chunks of 500 000 rows"]
+    LOAD --> VAL["to_feature_table<br/>validate: time, severity 1-4, physical ranges"]
+    SYN --> VAL
+    VAL --> FEAT["features: weather category, local time,<br/>geo cell, road flags"]
+    FEAT --> SPLIT["time_split<br/>train / valid / test by date"]
+    SPLIT -- "prepare" --> PREP[("data/prepared/<br/>accidents.pkl, accidents.json")]
+    PREP -- "train" --> FIT["fit majority, logreg, hgb on train<br/>balanced sample weights"]
+    SPLIT -- "demo" --> FIT
+    FIT --> SEL{"Highest valid macro-F1?"}
+    SEL -- "selected model" --> TEST["Test report one time<br/>in total and per source"]
+    TEST --> STORE[("models_out/<br/>severity_model.joblib, severity_report.json")]
+    STORE --> REVIEW{{"ANALYST<br/>reads the per-source test scores,<br/>trains again with --source if needed"}}
+    OW[/"OpenWeather response<br/>or recorded fixture"/] --> PARSE["parse_current<br/>units, local time, category, state"]
+    PARSE --> ROW{"feature_row<br/>value inside its range?"}
+    ROW -- "no" --> REF[/"ObservationError, HTTP 422"/]
+    ROW -- "yes" --> SCORE["score with the bundle pipeline"]
+    STORE --> SCORE
+    SCORE --> LIVE[/"Live score:<br/>predicted and expected severity"/]
+    PREP -- "forecast" --> CNT["daily_counts<br/>or a --counts CSV"]
+    CNT --> BT["backtest: 4 forecasters,<br/>rolling origin"]
+    BT --> FOUT[("models_out/<br/>forecast_backtest.csv, forecast_summary.csv")]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class REVIEW human
 ```
 
 ### 4.2 The life cycle of one live score
+
+```mermaid
+stateDiagram-v2
+    state "Request lat, lon" as Request
+    state "Rejected 401" as Unauthorized
+    state "Rejected 422, bad coordinates" as BadCoords
+    state "Raw weather response" as Raw
+    state "Observation in training units" as Observation
+    state "Rejected 422, ObservationError" as OutOfRange
+    state "Feature row" as Row
+    state "Severity probabilities" as Probs
+    state "Score response" as Response
+    [*] --> Request: client calls GET /score or roadrisk score
+    Request --> Unauthorized: API token set and not matched
+    Request --> BadCoords: lat or lon outside its range
+    Request --> Raw: provider.current
+    Raw --> Observation: parse_current
+    Observation --> OutOfRange: value outside RANGES or unknown category
+    Observation --> Row: feature_row
+    Row --> Probs: bundle pipeline predict_proba
+    Probs --> Response: predicted and expected severity, note
+    Response --> [*]
+    Unauthorized --> [*]
+    BadCoords --> [*]
+    OutOfRange --> [*]
+```
 
 1. The client asks for a score at a latitude and a longitude.
 2. The provider gets the current weather (OpenWeather) or the nearest fixture (offline).
@@ -234,11 +331,68 @@ flowchart TB
 8. The bundle pipeline gives the four severity probabilities.
 9. The response gives the predicted severity, the expected severity and a note on its meaning.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor AN as Analyst
+    participant CLI as roadrisk CLI
+    participant SEV as severity.py
+    participant FS as models_out folder
+    participant API as HTTP API
+    participant OWC as OpenWeatherClient
+    participant OW as OpenWeather
+    participant SCO as scoring.py
+    actor CL as Client
+
+    AN->>CLI: roadrisk prepare US_Accidents_March23.csv
+    CLI->>CLI: load_accidents, time_split, describe_splits
+    AN->>CLI: roadrisk train
+    CLI->>SEV: train_and_select(table)
+    SEV->>SEV: fit on train, score valid, select, score test once
+    SEV-->>CLI: best model and reports
+    CLI->>FS: save_bundle: severity_model.joblib, severity_report.json
+    AN->>CLI: roadrisk serve --port 8000
+    CLI->>API: create_app, uvicorn.run
+    API->>FS: load_bundle
+    CL->>API: GET /score?lat=44.98&lon=-93.27
+    API->>API: check_token, then lat and lon range check
+    API->>OWC: current(lat, lon)
+    OWC->>OW: GET /data/2.5/weather, units imperial
+    OWC->>OW: GET /geo/1.0/reverse
+    OW-->>OWC: weather JSON and state name
+    OWC->>OWC: parse_current
+    OWC-->>API: Observation
+    API->>SCO: score(bundle, observation)
+    SCO->>SCO: feature_row with range checks
+    SCO-->>API: probabilities, predicted and expected severity
+    API-->>CL: 200 with the score, or 422 with the error
+```
+
 ---
 
 ## 5. Data preparation and features
 
 **Purpose.** Turn the accident file into a validated feature table, split by date.
+
+```mermaid
+flowchart TD
+    IN[/"US-Accidents CSV or parquet"/] --> CHUNK["load_accidents<br/>read in chunks, stop at --max-rows"]
+    CHUNK --> COLS{"to_feature_table<br/>all RAW_COLUMNS present?"}
+    COLS -- "no" --> ERR[/"ValueError: input misses columns"/]
+    COLS -- "yes" --> BAD{"Start time valid and<br/>severity 1 to 4?"}
+    BAD -- "no" --> DROP["Drop the row<br/>count dropped_bad_time_or_severity"]
+    BAD -- "yes" --> CLIP["clip_to_ranges<br/>out-of-range value to missing, count per column"]
+    CLIP --> TIME["time_features from local Start_Time<br/>Sunrise_Sunset gives is_night when present"]
+    TIME --> MAP["from_text, geo_cell,<br/>road flags to 0 or 1"]
+    MAP --> SRC{"--source given?"}
+    SRC -- "yes" --> KEEP["Keep only these sources"]
+    SRC -- "no" --> SPLIT["time_split<br/>ROADRISK_TRAIN_END, ROADRISK_VALID_END"]
+    KEEP --> SPLIT
+    SPLIT --> DESC["describe_splits<br/>rows, dates, severity and source shares"]
+    DESC --> OUT[/"accidents.pkl and accidents.json"/]
+```
 
 | Input | Output |
 |---|---|
@@ -271,6 +425,22 @@ Use `--source Source1` (repeatable) to train on one source only, because the sev
 
 **Purpose.** Predict severity with a leak-free pipeline and select the model on later data.
 
+```mermaid
+flowchart TD
+    IN[/"Feature table with split column"/] --> EMPTY{"A split is empty?"}
+    EMPTY -- "yes" --> ERR[/"ValueError: check<br/>ROADRISK_TRAIN_END and ROADRISK_VALID_END"/]
+    EMPTY -- "no" --> LOOP["For each model in MODELS<br/>or --model"]
+    LOOP --> MAJ{"Model is majority?"}
+    MAJ -- "yes" --> FITM["fit with no weights"]
+    MAJ -- "no" --> FITW["fit with compute_sample_weight<br/>balanced, train split only"]
+    FITM --> VAL["metrics on valid"]
+    FITW --> VAL
+    VAL --> SEL["Select the highest valid macro-F1"]
+    SEL --> TEST["metrics and per_source<br/>on test, one time"]
+    TEST --> SAVE["save_bundle"]
+    SAVE --> OUT[("severity_model.joblib<br/>severity_report.json")]
+```
+
 | Model | Classifier | Imbalance |
 |---|---|---|
 | `majority` | Most frequent class (no weights) | - |
@@ -285,6 +455,18 @@ Use `--source Source1` (repeatable) to train on one source only, because the sev
 | Flags | Missing as 0 |
 | Categorical | Missing as `unknown`, one-hot with `min_frequency=20` and `handle_unknown="infrequent_if_exist"` |
 
+```mermaid
+flowchart LR
+    ROW[/"FEATURES columns"/] --> CT["make_preprocessor<br/>ColumnTransformer"]
+    CT --> NUM["num: 9 numeric columns<br/>median imputer with indicators, StandardScaler"]
+    CT --> FLG["flag: 15 flag columns<br/>missing as 0"]
+    CT --> CAT["cat: weather_cat, state, geo_cell<br/>missing as unknown, OneHotEncoder"]
+    NUM --> CLF["clf: DummyClassifier,<br/>LogisticRegression or HistGradientBoosting"]
+    FLG --> CLF
+    CAT --> CLF
+    CLF --> OUT[/"Probabilities for severity 1 to 4"/]
+```
+
 **Procedure**
 
 1. Fit each model on the train split with balanced sample weights.
@@ -297,6 +479,24 @@ Use `--source Source1` (repeatable) to train on one source only, because the sev
 ## 7. Live scoring and the count forecasts
 
 **Live scoring.** `roadrisk score LAT LON` and `GET /score?lat=..&lon=..` use the `OpenWeatherClient` when `OPENWEATHER_API_KEY` is set, else the `FixtureWeatherProvider`.
+
+```mermaid
+flowchart TD
+    IN[/"lat, lon"/] --> KEY{"OPENWEATHER_API_KEY set?"}
+    KEY -- "yes" --> OWC["OpenWeatherClient.current<br/>GET /data/2.5/weather, units imperial"]
+    OWC --> GEO["reverse_state<br/>GET /geo/1.0/reverse, US state code"]
+    KEY -- "no" --> FIX["FixtureWeatherProvider.current<br/>nearest recorded fixture"]
+    GEO --> PARSE["parse_current"]
+    FIX --> PARSE
+    PARSE --> UNITS{"Units of the response?"}
+    UNITS -- "standard" --> K["kelvin_to_f, mps_to_mph"]
+    UNITS -- "metric" --> C["celsius_to_f, mps_to_mph"]
+    UNITS -- "imperial" --> I["keep F and mph"]
+    K --> COMMON["hpa_to_inhg, meters_to_miles, mm_to_inches,<br/>from_openweather_id, dt + timezone, sunrise and sunset"]
+    C --> COMMON
+    I --> COMMON
+    COMMON --> OBS[/"Observation in training units"/]
+```
 
 | OpenWeather field | Training unit | Conversion |
 |---|---|---|
@@ -313,12 +513,45 @@ Road flags are not in the weather response, so a live row uses 0 for them unless
 
 **Count forecasts.** `roadrisk forecast` runs the rolling-origin backtest.
 
+```mermaid
+flowchart TD
+    IN[/"Daily counts<br/>daily_counts, --state or --counts CSV"/] --> FREQ["asfreq D<br/>interpolate missing days"]
+    FREQ --> ORIG["Next origin<br/>from --initial, step --step"]
+    ORIG --> HIST["history = days before the origin"]
+    HIST --> FC["For each forecaster:<br/>make_forecaster, fit history, predict --horizon"]
+    FC --> ROWS["One row per model, origin and step<br/>forecast, actual, MASE scale"]
+    ROWS --> MORE{"Another origin with<br/>a full horizon?"}
+    MORE -- "yes" --> ORIG
+    MORE -- "no" --> NONE{"Any rows?"}
+    NONE -- "no" --> ERR[/"ValueError: series too short"/]
+    NONE -- "yes" --> SUM["summarize<br/>MAE, RMSE, sMAPE, MASE, mae_vs_seasonal_naive"]
+    SUM --> OUT[("forecast_backtest.csv<br/>forecast_summary.csv")]
+```
+
 | Forecaster | Method |
 |---|---|
 | `naive` | The last value |
 | `seasonal_naive` | The value of the same weekday one week before |
 | `holt_winters` | Additive level, trend and weekly season. Smoothing chosen on one-step errors inside the history |
 | `lag_regression` | Ridge regression on weekday, day-of-year, trend and lags of 7, 14, 21 and 28 days (horizon up to 7) |
+
+```mermaid
+flowchart LR
+    H[/"history up to the origin"/] --> NAME{"make_forecaster<br/>name in FORECASTERS?"}
+    NAME -- "no" --> ERR[/"ValueError: unknown forecaster"/]
+    NAME -- "naive" --> NV["last value"]
+    NAME -- "seasonal_naive" --> SN["last 7 days, repeated"]
+    NAME -- "holt_winters" --> HW{"3 weeks of history or more?"}
+    HW -- "no" --> ERR2[/"ValueError"/]
+    HW -- "yes" --> HWG["grid search alpha, beta, gamma<br/>on one-step errors in the history"]
+    NAME -- "lag_regression" --> LR{"predict: horizon 7 or less?"}
+    LR -- "no" --> ERR3[/"ValueError"/]
+    LR -- "yes" --> LRF["StandardScaler + Ridge on weekday,<br/>day of year, trend, lags 7 to 28"]
+    NV --> OUT[/"predict horizon days"/]
+    SN --> OUT
+    HWG --> OUT
+    LRF --> OUT
+```
 
 **Backtest procedure**
 
@@ -330,6 +563,23 @@ Road flags are not in the weather response, so a live row uses 0 for them unless
 ---
 
 ## 8. Decision rules, ranges and metrics
+
+The HTTP API applies these checks in this sequence before the model sees a live row. `roadrisk score` applies the same checks, but not the token check.
+
+```mermaid
+flowchart TD
+    REQ[/"GET /score?lat, lon"/] --> TOK{"ROADRISK_API_TOKEN set<br/>and bearer token not equal?"}
+    TOK -- "yes" --> E401[/"HTTP 401: invalid token"/]
+    TOK -- "no" --> COORD{"lat in -90 to 90 and<br/>lon in -180 to 180?"}
+    COORD -- "no" --> E422A[/"HTTP 422: bad coordinates"/]
+    COORD -- "yes" --> OBS["provider.current<br/>Observation in training units"]
+    OBS --> RNG{"Each value inside RANGES?"}
+    RNG -- "no" --> E422B[/"HTTP 422: ObservationError,<br/>check the units"/]
+    RNG -- "yes" --> CAT{"weather_cat in VOCAB?"}
+    CAT -- "no" --> E422B
+    CAT -- "yes" --> SC["score: feature_row, predict_proba"]
+    SC --> OK[/"HTTP 200: predicted_severity,<br/>expected_severity, probabilities"/]
+```
 
 | Live value | Allowed range | Action outside the range |
 |---|---|---|
@@ -411,6 +661,22 @@ roadrisk serve --port 8000                      # GET /score?lat=44.98&lon=-93.2
 ```
 
 `python -m roadrisk_live` is the same as the `roadrisk` command.
+
+The commands use the files of the commands before them. An arrow points from a command to the command that reads its output.
+
+```mermaid
+flowchart LR
+    DEMO["roadrisk demo<br/>offline, all steps"] --> DOUT[("models_out/demo")]
+    SYN["roadrisk synth<br/>optional"] --> RAW[("data/raw")]
+    RAW --> PREP["roadrisk prepare"]
+    PREP --> PKL[("data/prepared/accidents.pkl")]
+    PKL --> TRAIN["roadrisk train"]
+    PKL --> FC["roadrisk forecast"]
+    TRAIN --> BUN[("models_out/severity_model.joblib")]
+    BUN --> SCORE["roadrisk score LAT LON"]
+    BUN --> SERVE["roadrisk serve"]
+    FC --> CSV[("models_out/forecast_*.csv")]
+```
 
 ### 10.4 Environment variables
 
